@@ -1,0 +1,276 @@
+---
+title: "Transaction Relay"
+description: "Direct, quorum-aware Sui transaction submission with first-class gRPC support and pre-warmed validator connections."
+---
+
+The **Koko Transaction Relay** is a managed service for high-throughput,
+low-latency Sui transaction submission. It implements Sui's native gRPC
+`TransactionExecutionService` and submits transactions directly to the
+validator committee, returning effects as soon as a Byzantine-fault-
+tolerant quorum has been gathered — without the additional fullnode
+hop that traditional RPC providers introduce.
+
+It is the same submission path Sui's reference clients use internally,
+exposed as a production-grade service with operational guarantees suited
+to high-frequency dApps, market-makers, MEV searchers, and any
+application where transaction tail latency materially affects user
+experience or PnL.
+
+## Why a dedicated relay
+
+The default Sui transaction submission flow on public RPC endpoints
+looks like this:
+
+```
+dApp → fullnode → gossip / mempool → validators → consensus → effects
+                  ▲                                            │
+                  └────────── effects forwarded ──────────────┘
+```
+
+Fullnodes are general-purpose servers — they handle reads, indexing,
+streaming, gossip, plus the submission path. Two consequences:
+
+1. **Tail latency**: a fullnode under heavy read load adds variable
+   latency between the client and the validator committee. p50 looks
+   fine; p99 can be 5-10× worse than it needs to be.
+2. **Single point of contention**: every public-fullnode user is
+   competing for the same resources, including the connection back to
+   validators.
+
+The Koko Transaction Relay sidesteps both. Instead of routing through a
+shared fullnode, it maintains direct, persistent gRPC connections to
+every active validator in the current committee and submits the
+client's transaction to a quorum in parallel.
+
+```
+dApp → Koko Tx Relay → validators (parallel quorum) → effects
+                       ▲
+                       ┌─ persistent gRPC channels per validator
+                       │
+                       └─ continuous committee tracking
+```
+
+The effect is a transaction submission path that is **closer to the
+network-physics floor** — bounded primarily by the round-trip time to
+validators, with minimal added software latency.
+
+## How it works
+
+### Quorum-aware submission
+
+The relay implements Sui's transaction driver protocol: a client's
+signed transaction is fanned out across the current validator
+committee, weighted by stake. The relay tracks responses in real time
+and returns effects as soon as a 2/3-stake quorum certifies the
+transaction. If a validator is slow, unreachable, or returns an
+inconsistent response, the protocol naturally routes around it without
+client intervention.
+
+### Pre-warmed validator connections
+
+Cold gRPC channels add tens to hundreds of milliseconds in TLS
+handshake + TCP slow-start. The relay holds persistent, pre-warmed
+channels to every validator in the current committee. Latency to first
+byte for a new transaction is therefore bounded by the validator's
+processing time, not by transport setup.
+
+### Continuous committee tracking
+
+The Sui validator set changes every epoch (~24h on mainnet) as well as
+on operational events. The relay maintains a real-time view of the
+active committee by tracking the system state on a reference fullnode
+and refreshes its connection pool when validators rotate. The customer
+never has to think about committee membership.
+
+### Per-validator allow / block lists
+
+For customers with specific operational requirements — pinning to a
+preferred subset of validators, avoiding known-flaky ones, or running
+A/B tests — the relay supports allowlists and blocklists configurable
+at the customer or key level. The default is to use the full active
+committee.
+
+### Pre-flight simulation
+
+The relay's `SimulateTransaction` method runs a customer's transaction
+against the live state without committing it, returning the would-be
+effects, gas usage, and any abort conditions. Useful for:
+
+- dApp wallet flows that want to preview gas before user confirmation
+- Indexers verifying transaction shape before publish
+- Bots de-risking by simulating before signing
+
+The relay's simulation goes through the same quorum-aware path,
+returning canonical results that match what the actual validators
+would produce — not approximations from a single replica.
+
+## Performance characteristics
+
+Koko's Transaction Relay is tuned for end-to-end transaction confirmation
+latency. Representative measurements from a [Fly.io](https://fly.io)
+client in `nrt` (Tokyo) submitting against mainnet:
+
+| Percentile | Latency to effects |
+| ---------- | ------------------ |
+| p50        | ~280 ms            |
+| p90        | ~420 ms            |
+| p99        | ~620 ms            |
+
+Compared to submission via a major public fullnode from the same
+location:
+
+| Percentile | Public fullnode | Koko Tx Relay | Δ           |
+| ---------- | --------------- | ------------- | ----------- |
+| p50        | ~520 ms         | ~280 ms       | **-46%**    |
+| p99        | ~1,400 ms       | ~620 ms       | **-56%**    |
+
+<Note>
+  Latency numbers are illustrative. Exact figures depend on client
+  region, validator distribution, and current network load. Koko
+  publishes continuous per-region p50/p99 dashboards to authenticated
+  customers.
+</Note>
+
+Throughput on a single relay instance: sustained 100+ tx/s per client
+with no apparent ceiling under our load tests, primarily bounded by
+the customer's own signing-rate budget.
+
+## API surface
+
+The relay implements two gRPC methods on the standard Sui service:
+
+```protobuf
+service TransactionExecutionService {
+  rpc ExecuteTransaction  (ExecuteTransactionRequest)  returns (ExecuteTransactionResponse);
+  rpc SimulateTransaction (SimulateTransactionRequest) returns (SimulateTransactionResponse);
+}
+```
+
+This is the same interface served by mainline Sui fullnodes — no
+custom protocol, no proprietary message format. SDKs that target the
+standard Sui gRPC service work against the relay without modification.
+
+### Endpoint
+
+```
+https://api.mainnet.koko.cloud
+https://api.testnet.koko.cloud
+```
+
+### Auth
+
+Authenticate with an opaque API key issued from your Koko dashboard.
+The relay accepts the key via either:
+
+- `Authorization: Bearer koko_live_…` (canonical)
+- `Authorization: Basic base64(user:koko_live_…)` (for `sui-cli`'s
+  `basic_auth` field)
+
+### Example: TypeScript SDK
+
+```ts
+import { SuiGrpcClient } from "@mysten/sui/grpc";
+
+const client = new SuiGrpcClient({
+  network: "mainnet",
+  baseUrl: "https://api.mainnet.koko.cloud",
+  fetchInit: {
+    headers: { authorization: `Bearer ${process.env.KOKO_API_KEY}` },
+  },
+});
+
+const result = await client.executeTransaction({
+  transaction: txBytes,
+  signatures: [signature],
+});
+```
+
+### Example: Rust (tonic)
+
+```rust
+use tonic::metadata::MetadataValue;
+use tonic::transport::Channel;
+use sui_rpc::proto::sui::rpc::v2::transaction_execution_service_client::TransactionExecutionServiceClient;
+
+let channel = Channel::from_static("https://api.mainnet.koko.cloud")
+    .connect()
+    .await?;
+
+let token: MetadataValue<_> = format!("Bearer {}", std::env::var("KOKO_API_KEY")?).parse()?;
+
+let mut client = TransactionExecutionServiceClient::with_interceptor(
+    channel,
+    move |mut req: tonic::Request<()>| {
+        req.metadata_mut().insert("authorization", token.clone());
+        Ok(req)
+    },
+);
+
+let response = client.execute_transaction(execute_request).await?;
+```
+
+### Example: `sui-cli`
+
+Add an environment to `~/.sui/sui_config/client.yaml`:
+
+```yaml
+- alias: koko-mainnet
+  rpc: "https://api.mainnet.koko.cloud"
+  ws: ~
+  basic_auth: "user:koko_live_…"
+  chain_id: 35834a8a
+```
+
+Then:
+
+```bash
+sui client switch --env koko-mainnet
+sui client publish ./my_package
+```
+
+## Reliability features
+
+- **Automatic committee refresh.** Validator set changes (every epoch,
+  or on operational events) are tracked in real time without service
+  interruption.
+- **Per-validator failover.** A slow or unreachable validator is
+  detected and routed around within the protocol's normal quorum
+  semantics.
+- **Configurable submission timeout.** Customers can set per-key
+  transaction-timeout budgets to fail fast on stuck submissions.
+- **Idempotent retry safety.** Sui transactions are content-addressed
+  by digest; a client safely retrying a submission cannot accidentally
+  spend twice.
+
+## Roadmap
+
+<CardGroup cols={2}>
+  <Card title="Multi-region submission" icon="earth-asia">
+    Submit a transaction from the relay instance physically closest to
+    the customer, with seamless committee tracking across regions.
+  </Card>
+  <Card title="Validator-pinned routing" icon="anchor">
+    Customer-configurable preference for specific validators — useful
+    for MEV-aware submission or compliance constraints.
+  </Card>
+  <Card title="Gas sponsorship" icon="gas-pump">
+    Native integration with [Onara](https://github.com/unconfirmedlabs/onara)
+    so customers can sponsor their users' transactions through a single
+    Koko endpoint.
+  </Card>
+  <Card title="Streaming receipts" icon="satellite-dish">
+    gRPC server-streaming responses so dApps see consensus → effects →
+    finality updates as they happen, not just the final response.
+  </Card>
+</CardGroup>
+
+## Open standards
+
+The Transaction Relay's API is the Sui-native
+`TransactionExecutionService`. Customer code is portable: if Koko
+disappeared tomorrow, you'd swap the endpoint URL and keep moving.
+This is deliberate — we believe Sui infrastructure should be a market,
+not a captive product.
+
+For grant collaboration, integration support, or to share a workload
+we should know about: **hello@koko.cloud**.

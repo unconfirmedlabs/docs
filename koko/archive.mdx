@@ -1,0 +1,332 @@
+---
+title: "Archive Reads"
+description: "Query Sui transactions, checkpoints, and objects from any point in mainnet history — backed by a continuously-verified checkpoint mirror."
+---
+
+**Koko Archive Reads** is a managed historical-data service for Sui. It
+implements the same gRPC `LedgerService` methods you already use for
+recent reads, but answers queries against a complete, durably-stored
+mirror of every checkpoint ever produced on Sui mainnet — back to
+genesis.
+
+It is built for the workloads where "the last 30 days" is not enough:
+tax and accounting platforms, on-chain forensics, analytics (dune-style
+dashboards, custom OLAP), NFT provenance trackers, governance auditors,
+ML training-data extraction, and any indexer that needs to backfill or
+re-index without depending on a fullnode operator's pruning schedule.
+
+## Why a dedicated archive
+
+Sui's reference fullnode software ships with an aggressive pruning
+policy. On mainnet, public fullnodes retain only the most recent
+**~30 days** of historical transactions and objects; older state is
+removed to keep nodes lean. This is the correct default for a live
+fullnode — but it is incompatible with a large set of real workloads:
+
+```
+                       ┌─────── public fullnodes ───────┐
+                       │                                │
+─── time ──►   genesis ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ now
+                       └── pruned, unrecoverable ──┘└~30d┘
+```
+
+If you need to:
+
+- Reconcile a portfolio's tax basis across a full calendar year.
+- Audit who held an NFT three quarters ago.
+- Train a model on a year of DeFi swaps.
+- Re-index your protocol from scratch after a schema change.
+- Reconstruct an exploit's transaction graph six months after the fact.
+
+…then "we only have the last month" is a hard wall.
+
+Running your own archival fullnode is a real operational burden:
+multi-terabyte storage that grows monotonically, snapshot management,
+recovery from corruption, and the engineering time to keep it in sync.
+
+The Koko Archive replaces that burden with a managed service that
+extends Sui's normal gRPC surface backwards through time:
+
+```
+─── time ──►   genesis ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ now
+                       └────── Koko Archive ──────┘└live┘
+                                                    ▲
+                       same gRPC API ───────────────┘
+```
+
+The seam between "archive" and "live" is transparent. Clients ask for a
+transaction by digest; the gateway routes the request to the archive if
+the data is older than the live retention window and to a fullnode
+otherwise. No client logic to write, no second endpoint to integrate.
+
+## How it works
+
+### Continuous checkpoint mirroring
+
+Sui's protocol-level unit of historical truth is the **checkpoint** — a
+batch of transactions, their effects, and the validator committee's
+signatures over the result. The Koko Archive subscribes to the mainnet
+checkpoint stream and writes every checkpoint, in canonical form, to
+durable object storage (Cloudflare R2 and Tigris, with 11 nines
+storage durability).
+
+Each archived checkpoint is verified before it is sealed:
+
+- Signature aggregation against the validator committee active at
+  that epoch.
+- Stake-weighted quorum check against the canonical epoch committee.
+- Internal consistency between the checkpoint's transaction list,
+  effects, and content digest.
+
+This is the same Byzantine-fault-tolerant verification a Sui fullnode
+performs when ingesting a checkpoint. A checkpoint that fails any of
+these checks is never written to the archive; the upstream is
+retried.
+
+### Same gRPC surface as live reads
+
+The archive does not introduce a new RPC. It implements the standard
+`sui.rpc.v2.LedgerService` methods and is reachable through the same
+[Koko RPC Gateway](/koko/gateway) endpoint your application already
+talks to. Methods supported at GA:
+
+| Method                                 | Range        | Notes                                                      |
+| -------------------------------------- | ------------ | ---------------------------------------------------------- |
+| `GetTransaction`                       | Genesis → now | Single digest lookup.                                      |
+| `BatchGetTransactions`                 | Genesis → now | Preferred for any backfill — amortises archive overhead.   |
+| `GetCheckpoint`                        | Genesis → now | By sequence number or content digest.                      |
+| `ListCheckpoints`                      | Genesis → now | Forward and reverse iteration, with cursor pagination.     |
+| `GetObject`                            | Historical (see below) | Objects present in the archive's reconstructed state. |
+
+<Note>
+  Historical `GetObject` semantics are nuanced. Sui object versions
+  are dense within an object's lifetime but sparse across the global
+  version namespace, and a queried `(object_id, version)` may have
+  been mutated, wrapped, or deleted later. The archive answers with
+  the canonical state at the requested version, mirroring what a
+  fullnode would have served at the time. Bulk historical-state
+  reconstruction across many objects is on the roadmap.
+</Note>
+
+### Transparent live / archive routing
+
+For each request, the gateway compares the data's age to the live
+retention window. Recent data is served from a live fullnode; older
+data is served from the archive. Clients do not need to know which.
+
+For batch reads spanning the boundary (e.g. a `BatchGetTransactions`
+call that lists digests from both inside and outside the live
+window), the gateway splits the request, fans out in parallel, and
+joins the response in the original digest order.
+
+### Verifiability
+
+Because the archive stores canonical checkpoints with their signed
+summaries, customers who care about chain-of-custody can re-verify
+any archived response against the committee that signed it. The
+`GetCheckpoint` response includes the protocol-level checkpoint
+summary, validator signatures, and committee references — exactly
+the bytes a fullnode would emit. Forensic and audit tooling can
+treat archive responses as first-class evidence.
+
+## Use cases
+
+- **Tax and accounting.** Reconstruct a wallet's full transaction
+  history across multiple tax years, including disposals that
+  happened more than 30 days ago.
+- **On-chain forensics.** Trace funds, follow exploit transaction
+  graphs, and rebuild attacker activity months after the fact.
+- **Analytics platforms.** Backfill dune-style dashboards, materialised
+  views, and OLAP cubes from a known checkpoint range without
+  scraping a live node.
+- **Indexer backfill.** Re-index your protocol from genesis after a
+  schema change, a bug fix, or onboarding a new chain partition.
+- **NFT provenance.** Resolve full ownership and metadata history for
+  a collection across its entire lifetime.
+- **Governance audits.** Reconstruct vote rolls, proposal contents,
+  and treasury flows for past epochs.
+- **ML training data.** Extract structured datasets of swaps, mints,
+  transfers, and Move events across arbitrary historical windows.
+
+## Performance characteristics
+
+Archive reads have a slightly higher base latency than live reads
+because they cross object storage rather than a hot in-memory
+fullnode cache. Representative same-region figures:
+
+| Method                              | Source   | p50     | p90     |
+| ----------------------------------- | -------- | ------- | ------- |
+| `GetTransaction` (recent)           | live     | ~95 ms  | ~120 ms |
+| `GetTransaction` (archived)         | archive  | ~70 ms  | ~110 ms |
+| `BatchGetTransactions` (200 digests)| archive  | ~180 ms | ~260 ms |
+| `GetCheckpoint`                     | archive  | ~60 ms  | ~90 ms  |
+| `ListCheckpoints` (page of 100)     | archive  | ~140 ms | ~210 ms |
+
+<Note>
+  Numbers are illustrative and depend on client region, the age of
+  the data, and concurrent load. Authenticated customers see
+  continuous per-region p50/p99 dashboards alongside their live RPC
+  metrics.
+</Note>
+
+**Throughput** on archive endpoints is high — the underlying object
+storage parallelises well — but cost scales with request count. For
+any workload that touches more than a handful of historical items,
+prefer the batch methods (`BatchGetTransactions`, paginated
+`ListCheckpoints`) over fanning out individual gRPC calls. A single
+`BatchGetTransactions` with 200 digests is dramatically cheaper, in
+both wall-clock and credits, than 200 sequential `GetTransaction`
+calls.
+
+## Pricing
+
+Archive methods cost a small premium in credits over their live-read
+counterparts, reflecting the storage and compute cost of historical
+access. Exact per-method costs are published in the [RPC
+Gateway](/koko/gateway) pricing surface and in every customer's
+dashboard.
+
+Archive reads are available on the **Business** plan and above.
+
+## API surface
+
+The endpoint, authentication, and SDK integration are identical to
+the live [RPC Gateway](/koko/gateway). There is no archive-specific
+client library and no separate base URL.
+
+### Endpoint
+
+```
+https://api.mainnet.koko.cloud
+```
+
+### Example: TypeScript SDK
+
+```ts
+import { SuiGrpcClient } from "@mysten/sui/grpc";
+
+const client = new SuiGrpcClient({
+  network: "mainnet",
+  baseUrl: "https://api.mainnet.koko.cloud",
+  fetchInit: {
+    headers: { authorization: `Bearer ${process.env.KOKO_API_KEY}` },
+  },
+});
+
+// A digest from 18 months ago — would 404 on a public fullnode,
+// returns canonically via Koko.
+const tx = await client.getTransaction({
+  digest: "ArchivedDigestFromQ4_2024…",
+  readMask: { paths: ["digest", "effects", "events", "balance_changes"] },
+});
+
+// Pull a contiguous range of checkpoints for an indexer backfill.
+const page = await client.listCheckpoints({
+  pageSize: 100,
+  pageToken: cursor,
+  readMask: { paths: ["sequence_number", "digest", "timestamp"] },
+});
+```
+
+### Example: Rust (tonic)
+
+```rust
+use tonic::metadata::MetadataValue;
+use tonic::transport::Channel;
+use sui_rpc::proto::sui::rpc::v2::ledger_service_client::LedgerServiceClient;
+use sui_rpc::proto::sui::rpc::v2::BatchGetTransactionsRequest;
+
+let channel = Channel::from_static("https://api.mainnet.koko.cloud")
+    .connect()
+    .await?;
+
+let token: MetadataValue<_> = format!("Bearer {}", std::env::var("KOKO_API_KEY")?).parse()?;
+
+let mut client = LedgerServiceClient::with_interceptor(
+    channel,
+    move |mut req: tonic::Request<()>| {
+        req.metadata_mut().insert("authorization", token.clone());
+        Ok(req)
+    },
+);
+
+let response = client
+    .batch_get_transactions(BatchGetTransactionsRequest {
+        digests: historical_digests,        // any age, back to genesis
+        ..Default::default()
+    })
+    .await?;
+```
+
+### Example: `sui-cli`
+
+The CLI's `client.yaml` is unchanged — the same `koko-mainnet`
+environment from the [RPC Gateway](/koko/gateway#example-sui-cli)
+example resolves archive reads automatically:
+
+```bash
+sui client switch --env koko-mainnet
+sui client tx-block 9pZ…       # works regardless of age
+```
+
+### Example: `grpcurl`
+
+```bash
+grpcurl \
+  -H "authorization: Bearer ${KOKO_API_KEY}" \
+  -d '{"digests": ["9pZ…", "Ab1…", "Q3x…"]}' \
+  api.mainnet.koko.cloud:443 \
+  sui.rpc.v2.LedgerService/BatchGetTransactions
+```
+
+## Reliability features
+
+- **11-nines storage durability.** Archived checkpoints are written
+  to multi-region, multi-replica object storage (Cloudflare R2 /
+  Tigris) and are not subject to fullnode pruning, snapshot rollover,
+  or operational eviction.
+- **Checkpoint-verified ingest.** Every checkpoint added to the
+  archive passes the validator committee's signature check before it
+  is sealed; corrupted or stale upstream data is rejected.
+- **Append-only on the canonical path.** Sealed checkpoints are
+  never rewritten. Backfills and corrections happen in side tables
+  with audit history; canonical bytes are immutable.
+- **Multi-region read replicas.** Archive read traffic is served from
+  the customer's nearest region; the underlying durable store is
+  geo-replicated.
+- **Cross-region failover.** Region-level outages fail over
+  transparently with no client reconfiguration.
+
+## Roadmap
+
+<CardGroup cols={2}>
+  <Card title="Time-range scanners" icon="timeline">
+    `ScanTransactions` and `ScanEvents` over arbitrary historical
+    windows, with server-streaming responses for backfill workloads.
+  </Card>
+  <Card title="Historical object state" icon="layer-group">
+    `GetObject` at arbitrary historical versions, with bulk
+    reconstruction of object snapshots at a target checkpoint.
+  </Card>
+  <Card title="Move event filters" icon="filter">
+    Native filtering on Move event type, package, and arbitrary
+    field values across the full archive — no client-side scanning.
+  </Card>
+  <Card title="Analytics integrations" icon="chart-mixed">
+    First-class adapters for dbt, DuckDB, and Parquet exports so
+    analytics teams can pull a window of canonical Sui history into
+    their warehouse.
+  </Card>
+</CardGroup>
+
+## Open standards
+
+The Archive's API is the Sui-native `sui.rpc.v2.LedgerService`.
+Customer code is portable: an application written against Koko's
+archive can read recent data from any conforming Sui fullnode without
+modification. The archive's value is operational — durable storage,
+verified ingest, and a single endpoint for all of history — not
+proprietary lock-in.
+
+For grant collaboration, integration support, or to share an archival
+workload we should know about: **hello@koko.cloud**.

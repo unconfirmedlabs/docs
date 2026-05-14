@@ -1,0 +1,248 @@
+---
+title: "Intelligent Caching"
+description: "Body-aware caching for Sui gRPC methods — the deterministic ones return in single-digit microseconds instead of touching the upstream network."
+---
+
+The Koko RPC Gateway includes a **body-aware response cache** for Sui's
+deterministic read methods. Where a generic HTTP cache can only key on
+URL + headers — which makes it useless for gRPC, since the query is in
+the request body — Koko parses the protobuf body, decides cacheability
+per-method, and serves repeat hits from memory.
+
+For workloads dominated by lookups of immutable historical data
+(indexers backfilling, dApps showing transaction history, MEV bots
+re-checking known transactions), this is the difference between every
+request paying a full network round-trip and most requests returning
+locally in microseconds.
+
+## Why caching needs to live in the gateway
+
+Three layers of caching that don't work for Sui gRPC:
+
+1. **CDN caches** (Cloudflare, Fastly, etc.) key on the URL and HTTP
+   method. gRPC requests are all `POST` to a single method path per
+   call, with the query encoded in the request body. The CDN sees every
+   request as unique. Hit rate: 0%.
+
+2. **HTTP-proxy caches** (Varnish, nginx) have the same body-blindness
+   without custom Lua modules.
+
+3. **Client-side caches** (SDK-level) are per-client. The same
+   transaction queried by 100 different bots hits upstream 100 times.
+
+Koko's gateway sits in the gRPC protocol layer. It knows that a
+`GetTransaction(digest=X)` response is content-addressed and immutable
+— the answer for digest `X` today is the same as the answer for digest
+`X` tomorrow, forever. That insight is what makes the cache
+high-hit-rate without compromising correctness.
+
+## Cache policy: two tiers
+
+Each Sui gRPC method is classified by how its response varies with
+input.
+
+### Tier 1 — content-addressed, immutable
+
+The response is deterministic given the input bytes, with no time
+dependency. These are always cached.
+
+| Method                                            | Why immutable                                                  |
+| ------------------------------------------------- | -------------------------------------------------------------- |
+| `LedgerService.GetTransaction`                    | Transactions are content-addressed by digest; never re-issued. |
+| `LedgerService.BatchGetTransactions`              | Same, batched.                                                 |
+| `MovePackageService.GetPackage`                   | Move packages are immutable on-chain.                          |
+| `MovePackageService.GetDatatype`                  | Datatype definitions are part of the immutable package.        |
+| `MovePackageService.GetFunction`                  | Function signatures are part of the immutable package.         |
+
+### Tier 2 — cacheable when version-pinned
+
+The response is deterministic *if* the customer specifies a particular
+version or sequence number. Without that pin, the response means "give
+me the latest" and would drift over time.
+
+| Method                                  | Pin field                       |
+| --------------------------------------- | ------------------------------- |
+| `LedgerService.GetObject`               | `version` (proto field 2)       |
+| `LedgerService.GetCheckpoint`           | `sequence_number` (proto field 1) |
+
+When the request body contains the pin field, the response is cached
+the same way as Tier 1. When it doesn't, the request bypasses cache
+and goes straight to the upstream so the customer always gets fresh
+data.
+
+### Tier 0 — never cached
+
+Anything else (state-dependent reads, balance queries, current epoch
+information, owned-objects listings, transaction submission). These
+pass through the gateway untouched.
+
+## How the cache works
+
+```
+client
+  │
+  ▼
+gateway middleware chain
+  │
+  ├─ auth          (still runs — invalid keys still rejected)
+  ├─ usage         (still runs — cache hits still consume credits)
+  ├─ rate limit    (still runs — no quota workaround via cache)
+  ├─ cache  ◄─────────┐
+  │                   │
+  ├─ on hit  ─────────┘   replay cached response, skip upstream
+  ├─ on miss ─────►   forward to upstream, capture response, store
+```
+
+### Cache key
+
+`<method-path>:sha256(request-body)`
+
+The key is **customer-agnostic on purpose**. Two customers asking for
+the same transaction digest share the response, which is correct —
+the answer is deterministic given the input. This is a property of
+the data, not a leak: customer A can't observe what customer B queried.
+Auth, rate-limiting, and per-customer credit accounting all happen
+*outside* the cache layer, so each customer still pays for their own
+calls.
+
+### Protobuf field detection for Tier 2
+
+The gateway walks the gRPC-framed protobuf body looking for the
+pinning field number at the top level. It's a small, dependency-free
+scanner: read the 5-byte frame header, then walk varint-tagged fields,
+returning true when the wanted field number is present. The scan is
+~100ns per request — invisible against the rest of the request budget.
+
+If the request body is compressed (the gRPC `compression-flag` byte is
+non-zero), the scanner conservatively returns "not pinned" rather than
+decompressing inline. Compressed Sui RPC bodies are rare in practice;
+the loss of cacheability for that edge case is acceptable.
+
+### Cache hit response
+
+Cache hits are indistinguishable from a real upstream response at the
+protocol level — same content-type, same status, same trailers,
+identical body bytes. The only difference is a diagnostic header
+clients can read if they want to:
+
+```
+x-koko-cache: hit   (response served from cache)
+x-koko-cache: miss  (response forwarded to upstream)
+```
+
+Cache-hit latency from the gateway's perspective: a few microseconds.
+End-to-end, the customer sees roughly the round-trip time from their
+machine to the gateway, with no upstream network hop. Typical numbers
+for a client in the same region as the gateway:
+
+| Phase             | Cache hit | Cache miss      |
+| ----------------- | --------: | --------------: |
+| Gateway lookup    |    < 10μs |        ~ 200ns* |
+| Upstream RPC      |         — |     50–200ms    |
+| Total (illustrative) | **~5ms** | **~70–250ms**|
+
+\* auth-cache hit, then cache lookup happens after.
+
+### Storage and eviction
+
+The cache lives in process memory as a bounded LRU. Capped at:
+
+- **10,000 entries** per gateway machine
+- **256 KB** per response body (oversized responses bypass cache)
+- **64 KB** per request body (oversized requests bypass cache)
+
+Cached responses are never explicitly invalidated — Tier 1 and Tier 2
+methods are content-immutable, so they're correct forever. LRU
+eviction handles memory pressure: the least-recently-used entry gets
+dropped when the cache is full.
+
+## What's deliberately not cached
+
+- **`ExecuteTransaction` / `SimulateTransaction`** — writes and their
+  simulations are never cached. Even a "successful" execute response
+  shouldn't be replayed, and a simulation result depends on the
+  current chain state.
+- **Failed gRPC responses** (`grpc-status != 0`) — only successful
+  responses become cache entries. A "transaction not found" today might
+  be "transaction found" tomorrow if the digest hadn't propagated yet.
+- **Rate-limited responses** (`grpc-status: 8`) — denied before
+  reaching the cache layer.
+- **Customer-specific endpoints** — `GetServiceInfo` includes current
+  epoch and checkpoint height, which drift.
+
+## Hit-rate expectations
+
+Real-world hit rates depend on workload shape. Representative numbers
+from internal testing:
+
+| Workload                                         | Steady-state hit rate |
+| ------------------------------------------------ | --------------------: |
+| Indexer doing historical transaction backfill    |               80–95% |
+| dApp showing tx history for active users         |               40–60% |
+| MEV bot polling for fresh state                  |                5–15% |
+| Forensics / audit tooling re-scanning history    |               90%+    |
+
+A working-set fit consideration: at ~5 KB per response × 10,000
+entries, the cache holds roughly 50 MB of unique responses. For an
+indexer working through a 1M-transaction backfill, that's ~1% of the
+working set — hit rate climbs as the same recent transactions get
+re-queried.
+
+## Reliability features
+
+- **Cache is best-effort.** A cache lookup error never fails a
+  customer's request; it falls through to upstream.
+- **Customer-isolated billing.** Cache hits consume credits and bump
+  rate-limit counters just like upstream-served requests. Cache cannot
+  be used as a quota-bypass.
+- **Protocol-transparent.** Cache hits and misses are indistinguishable
+  to a Sui-native client. SDKs that don't read the `x-koko-cache`
+  header can't tell the difference.
+- **Bounded memory.** LRU + size caps mean the cache cannot drive an
+  out-of-memory condition under any workload.
+- **Conservative on framing.** When a request body's compression or
+  framing is anything other than the standard gRPC wire format, the
+  cache bypasses and passes through. Correctness is preferred over
+  hit-rate.
+
+## Roadmap
+
+<CardGroup cols={2}>
+  <Card title="Shared cache tier" icon="layer-group">
+    Optional second-tier cache (Redis) shared across gateway instances,
+    for customers who want hits to survive idle windows and machine
+    restarts.
+  </Card>
+  <Card title="Per-method TTL overrides" icon="hourglass">
+    For methods that are semantically near-immutable but technically
+    drift (e.g. `GetEpoch` for a closed epoch), opt-in TTL with
+    refresh-ahead.
+  </Card>
+  <Card title="Range and history scanners" icon="magnifying-glass">
+    Pre-warmed caches for `ListCheckpoints` over historical ranges,
+    backed by the Archive Reads tier.
+  </Card>
+  <Card title="Negative response caching" icon="ban">
+    Cache "not found" responses for digests that are demonstrably
+    absent across a quorum of fullnodes — eliminates retry storms from
+    misbehaving indexers.
+  </Card>
+</CardGroup>
+
+## Observability
+
+Authenticated customers can read their own cache hit-rate statistics
+from the Koko dashboard. We also expose Prometheus-format metrics for
+operators we partner with, broken down by method, customer plan, and
+gateway region.
+
+## Open standards
+
+The cache layer is fully transparent at the protocol level. There is
+no "Koko cache mode" customers have to opt into, no proprietary
+headers required, no SDK fork. Sui gRPC clients work as-is; cache hits
+just arrive faster. The same code that works against a public Sui
+fullnode works against Koko, including its cached responses.
+
+For questions, integration support, or to share a workload we should
+optimize for: **hello@koko.cloud**.

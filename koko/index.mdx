@@ -1,0 +1,62 @@
+---
+title: "Koko"
+description: "Production-grade Sui infrastructure: transaction submission, RPC, and historical data — built around Sui's native gRPC protocols."
+---
+
+Koko is a suite of high-performance Sui infrastructure services, designed
+to support the workloads of high-frequency dApps, trading systems, indexers,
+and any application where Sui transaction latency, RPC reliability, or
+historical data access is mission-critical.
+
+## Products
+
+<CardGroup cols={2}>
+  <Card title="Transaction Relay" icon="bolt" href="/koko/tx-relay">
+    Direct, quorum-aware Sui transaction submission. Lower-latency than
+    fullnode forwarding, with first-class support for Sui's gRPC
+    transaction execution service.
+  </Card>
+  <Card title="RPC Gateway" icon="globe" href="/koko/gateway">
+    Authenticated, rate-limited Sui gRPC access with usage tracking,
+    per-customer credit budgets, and feature gating.
+  </Card>
+  <Card title="Archive Reads" icon="clock-rotate-left" href="/koko/archive">
+    Historical transactions and objects beyond the 30-day public fullnode
+    window — backed by a continuously-updated checkpoint mirror.
+  </Card>
+  <Card title="Sui-native Auth" icon="key" href="/koko">
+    Customer identity tied directly to Sui addresses via zkLogin. Pay for
+    plans in USDC on-chain. (Docs coming soon.)
+  </Card>
+</CardGroup>
+
+## Design principles
+
+- **Sui-native first.** Every component speaks Sui's gRPC services
+  directly. No JSON-RPC translation layers, no protocol shims.
+- **Predictable latency.** We measure p50/p99 across global regions
+  and validators, surface them in customer dashboards, and tune
+  validator selection to keep tails tight.
+- **Production reliability.** Quorum-aware submission, automatic
+  committee tracking, transparent failover. Every layer is designed for
+  24/7 operation under real load.
+- **Composable with the Sui ecosystem.** Built around Sui's primitives
+  so customers' code stays portable. Switching off Koko should be as
+  easy as switching the endpoint URL.
+
+## Status
+
+| Product            | Status              | Networks            |
+| ------------------ | ------------------- | ------------------- |
+| Transaction Relay  | Public beta         | mainnet, testnet    |
+| RPC Gateway        | Public beta         | mainnet, testnet    |
+| Archive Reads      | Private alpha       | mainnet             |
+| Sui-native Auth    | In development      | —                   |
+
+<Note>
+  Koko is built and operated by [Unconfirmed
+  Labs](https://github.com/unconfirmedlabs), the team behind several
+  Sui-native open-source primitives including MusicOS, PartyOS, ORI, and
+  the Sui gRPC SDK extensions. Reach out at hello@koko.cloud for early
+  access or grant collaboration.
+</Note>

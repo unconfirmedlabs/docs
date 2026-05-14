@@ -1,0 +1,390 @@
+---
+title: "RPC Gateway"
+description: "Authenticated, rate-limited Sui gRPC access with per-customer credit budgets, dual-axis rate limiting, and predictable latency."
+---
+
+The **Koko RPC Gateway** is a managed front door for Sui's gRPC services.
+It exposes the canonical `LedgerService`, `LiveDataService`,
+`MovePackageService`, `NameService`, and `TransactionExecutionService`
+behind a single authenticated endpoint, with per-customer rate limits,
+usage accounting in credits, and plan-gated access to premium
+capabilities.
+
+It is built for teams that have outgrown the operational guarantees of
+shared public RPC — indexers, exchanges, wallets, market-makers, and any
+production dApp that needs reads to behave like reads: predictable
+latency, predictable rate limits, and a real account on the other end.
+
+## Why a dedicated gateway
+
+The default Sui RPC flow on a shared public fullnode looks like this:
+
+```
+all dApps ─┐
+all wallets─┤
+all indexers┤──► shared fullnode ──► response
+all bots ──┘     (one global limit,
+                  no per-customer view)
+```
+
+A single shared fullnode has no notion of who you are. When a noisy
+neighbour spikes, every other client gets clipped. Latency becomes a
+function of strangers' workloads. There is no SLA, no per-key budget,
+no ability to reason about your own rate limits.
+
+The Koko RPC Gateway slots in front of a managed pool of Sui fullnodes
+and turns that flow into something a production engineer can reason
+about:
+
+```
+your app ──► Koko RPC Gateway ──► upstream Sui fullnodes
+              │
+              ├─ opaque API key auth
+              ├─ per-customer read / write rate buckets
+              ├─ per-method credit accounting
+              ├─ plan-gated feature flags
+              └─ writes routed to the Koko Tx Relay
+```
+
+The gateway is co-located across multiple regions, holds warm gRPC
+channels to its upstream fullnodes, and authenticates requests in the
+order of a few hundred nanoseconds on the hot path. Reads add no
+measurable latency over hitting a well-provisioned fullnode directly;
+writes are transparently forwarded to the [Koko Transaction
+Relay](/koko/tx-relay) for quorum-aware submission.
+
+## How it works
+
+### Sui-native gRPC, end to end
+
+The gateway speaks the same gRPC services that ship in `sui-rpc`. No
+JSON-RPC translation, no proprietary message format, no SDK fork.
+Anything that targets the standard Sui gRPC service — `@mysten/sui`'s
+`SuiGrpcClient`, the Rust SDK over `tonic`, `grpcurl` — works against
+Koko by setting the endpoint URL and one auth header.
+
+Services currently routed by the gateway:
+
+| Service                        | Status   |
+| ------------------------------ | -------- |
+| `LedgerService`                | GA       |
+| `LiveDataService`              | GA       |
+| `MovePackageService`           | GA       |
+| `NameService`                  | GA       |
+| `TransactionExecutionService`  | GA (relayed) |
+| `SubscriptionService`          | Roadmap  |
+
+### Opaque API key authentication
+
+Keys are issued from the Koko dashboard and have the shape
+`koko_live_<22-char id><22-char secret>`. The id half identifies the
+key; the secret half is verified server-side with a constant-time
+compare against a salted hash. The full key is never logged.
+
+The gateway accepts the key via either:
+
+- `Authorization: Bearer koko_live_…` — canonical form, used by
+  every SDK and `grpcurl`.
+- `Authorization: Basic base64(user:koko_live_…)` — provided for
+  `sui-cli`, which exposes only a `basic_auth` field in
+  `client.yaml`.
+
+A bad or missing key returns gRPC status `UNAUTHENTICATED` (16). The
+gateway never falls through to anonymous access — there is no public
+tier on the live endpoint.
+
+### Dual-axis rate limiting
+
+Every customer has two independent token-bucket limiters:
+
+- A **read** bucket, drained by `LedgerService`, `LiveDataService`,
+  `MovePackageService`, and `NameService` methods.
+- A **write** bucket, drained by `SimulateTransaction` and
+  `ExecuteTransaction` on `TransactionExecutionService`.
+
+The buckets refill at the customer's plan rates (read rps / write rps)
+and have a burst capacity equivalent to ~15 seconds of sustained
+traffic. Splitting reads from writes means a burst of indexer reads
+cannot starve out the same key's transaction submissions, and vice
+versa.
+
+A request that exceeds its bucket returns gRPC status
+`RESOURCE_EXHAUSTED` (8) with two informational headers attached so
+clients can back off intelligently:
+
+```
+x-ratelimit-limit:  <plan rps for the relevant bucket>
+x-ratelimit-bucket: read | write
+```
+
+Rate-limited requests **do not consume credits**.
+
+### Per-method credit accounting
+
+Credits are Koko's monthly usage unit. Each plan ships with a monthly
+allotment; each method has a cost reflecting its work on the upstream
+fullnode. Light methods (`GetServiceInfo`, single `GetTransaction`,
+`GetObject`, `GetEpoch`, `GetPackage`) cost 1 credit. Batch and
+list methods (`BatchGetTransactions`, `BatchGetObjects`,
+`ListOwnedObjects`, `ListBalances`) cost more, typically 3-5 credits,
+reflecting their fan-out on the upstream. `SimulateTransaction` costs
+5; `ExecuteTransaction` costs 10.
+
+Pricing detail to keep in mind when modelling spend:
+
+- Rate-limited requests are free.
+- Requests that hit the upstream and **return an error** still consume
+  credits — the work was real on our side and the upstream's.
+- Method credit costs are versioned and only revised on the calendar
+  boundary; you'll never see a mid-month change.
+
+### Write-path handoff to the Transaction Relay
+
+When the gateway sees a method on `TransactionExecutionService`, it
+short-circuits the normal read path and forwards the request to the
+[Koko Transaction Relay](/koko/tx-relay), which submits directly to
+the validator committee. To the customer, this is invisible — the
+same endpoint, the same auth header, the same gRPC method, the same
+response shape. The handoff happens at the routing layer and adds a
+single intra-region hop.
+
+This is what lets a customer point all of their Sui traffic at one
+endpoint (`api.mainnet.koko.cloud`) and still get the relay's
+quorum-aware submission path on writes.
+
+### Plan-gated features
+
+Some capabilities are gated on plan tier and surfaced as feature
+flags on the customer record. The gateway enforces them at request
+admission:
+
+| Feature              | Description                                                     | Required plan |
+| -------------------- | --------------------------------------------------------------- | ------------- |
+| `streaming`          | gRPC server-streaming methods (`SubscriptionService`, roadmap)  | Developer+    |
+| `archive`            | Historical reads beyond the ~30-day fullnode window (see [Archive Reads](/koko/archive)) | Business+    |
+| `priority_validators`| Preferred-validator routing on the relay write path             | Business+    |
+| `sponsored_tx`       | Native integration with [Onara](https://github.com/unconfirmedlabs/onara) gas sponsorship | Scale+        |
+| `webhooks`           | Outbound webhooks for usage and limit events                    | Scale+        |
+
+## Plans
+
+| Plan        | Price        | Monthly credits | Read rps | Write rps | Notes                                            |
+| ----------- | ------------ | --------------- | -------- | --------- | ------------------------------------------------ |
+| Free        | $0           | 1,000,000       | 10       | 1         | Hobby / evaluation.                              |
+| Developer   | $19 / month  | 10,000,000      | 50       | 5         | Adds streaming.                                  |
+| Business    | $199 / month | 100,000,000     | 200      | 50        | Adds archive reads + priority validators.        |
+| Scale       | $799 / month | 500,000,000     | 1,000    | 200       | Adds sponsored transactions + webhooks.          |
+| Enterprise  | Custom       | Custom          | Custom   | Custom    | Dedicated capacity, custom SLAs, private peering.|
+
+<Note>
+  Plans, credit costs, and feature flags are versioned and surfaced in
+  every customer's dashboard. We don't surprise customers with policy
+  changes mid-month; updates land on the calendar boundary with at
+  least 30 days' notice.
+</Note>
+
+## Performance characteristics
+
+The gateway is designed to add as close to zero overhead as possible
+on the read path. Authentication is a constant-time hash compare with
+a hot in-memory cache; rate limiting is a single atomic decrement on a
+per-customer bucket. Representative figures from a same-region client
+calling `LedgerService.GetTransaction`:
+
+| Stage                                   | Latency      |
+| --------------------------------------- | ------------ |
+| Auth lookup (cache hit)                 | ~200 ns      |
+| Auth lookup (cache miss, first request) | ~5–30 ms     |
+| Rate-limit check                        | ~100 ns      |
+| Upstream fullnode round-trip            | dominant     |
+| **Gateway overhead, steady state**      | **sub-ms**   |
+
+Compared to direct access via a major public fullnode from the same
+client region, on `GetTransaction` for a recent digest:
+
+| Percentile | Public fullnode | Koko RPC Gateway | Notes                                            |
+| ---------- | --------------- | ---------------- | ------------------------------------------------ |
+| p50        | ~90 ms          | ~95 ms           | Public fullnodes are fast on the happy path.     |
+| p90        | ~240 ms         | ~120 ms          | Public fullnodes start to fan their tail.        |
+| p99        | ~1,800 ms       | ~180 ms          | Shared rate limits and noisy neighbours dominate.|
+
+<Note>
+  Latency numbers are illustrative. Real figures depend on client
+  region, time of day, and the current upstream pool composition.
+  Authenticated customers see continuous per-region p50/p99
+  dashboards.
+</Note>
+
+The takeaway: median latency on the public fullnode and the Koko
+gateway is similar, because both are bounded by network physics. The
+**tails** differ — the gateway is sized per-customer rather than
+shared with the world, so p99 is bounded by your own behaviour, not by
+strangers'.
+
+## API surface
+
+The gateway is a thin authenticated routing layer over the canonical
+Sui gRPC services. There is no Koko-specific protocol — your code
+talks to `sui.rpc.v2.*` exactly as documented upstream.
+
+### Endpoint
+
+```
+https://api.mainnet.koko.cloud
+https://api.testnet.koko.cloud
+```
+
+### Auth
+
+```
+Authorization: Bearer koko_live_<id><secret>
+```
+
+Or, for `sui-cli`'s `basic_auth` field:
+
+```
+Authorization: Basic base64("user:koko_live_<id><secret>")
+```
+
+### Example: TypeScript SDK
+
+```ts
+import { SuiGrpcClient } from "@mysten/sui/grpc";
+
+const client = new SuiGrpcClient({
+  network: "mainnet",
+  baseUrl: "https://api.mainnet.koko.cloud",
+  fetchInit: {
+    headers: { authorization: `Bearer ${process.env.KOKO_API_KEY}` },
+  },
+});
+
+const tx = await client.getTransaction({
+  digest: "9pZ…",
+  readMask: { paths: ["digest", "effects", "events"] },
+});
+```
+
+### Example: Rust (tonic)
+
+```rust
+use tonic::metadata::MetadataValue;
+use tonic::transport::Channel;
+use sui_rpc::proto::sui::rpc::v2::ledger_service_client::LedgerServiceClient;
+use sui_rpc::proto::sui::rpc::v2::GetTransactionRequest;
+
+let channel = Channel::from_static("https://api.mainnet.koko.cloud")
+    .connect()
+    .await?;
+
+let token: MetadataValue<_> = format!("Bearer {}", std::env::var("KOKO_API_KEY")?).parse()?;
+
+let mut client = LedgerServiceClient::with_interceptor(
+    channel,
+    move |mut req: tonic::Request<()>| {
+        req.metadata_mut().insert("authorization", token.clone());
+        Ok(req)
+    },
+);
+
+let response = client
+    .get_transaction(GetTransactionRequest {
+        digest: Some("9pZ…".into()),
+        ..Default::default()
+    })
+    .await?;
+```
+
+### Example: `sui-cli`
+
+Add an environment to `~/.sui/sui_config/client.yaml`:
+
+```yaml
+- alias: koko-mainnet
+  rpc: "https://api.mainnet.koko.cloud"
+  ws: ~
+  basic_auth: "user:koko_live_…"
+  chain_id: 35834a8a
+```
+
+Then:
+
+```bash
+sui client switch --env koko-mainnet
+sui client object 0xabc…
+```
+
+### Example: `grpcurl`
+
+```bash
+grpcurl \
+  -H "authorization: Bearer ${KOKO_API_KEY}" \
+  -d '{"digest": "9pZ…"}' \
+  api.mainnet.koko.cloud:443 \
+  sui.rpc.v2.LedgerService/GetTransaction
+```
+
+## gRPC status codes
+
+The gateway returns standard gRPC statuses; nothing custom on the
+wire.
+
+| Code                       | Meaning                                                                 |
+| -------------------------- | ----------------------------------------------------------------------- |
+| `UNAUTHENTICATED` (16)     | Missing, malformed, or revoked API key.                                 |
+| `PERMISSION_DENIED` (7)    | Plan does not include the requested feature (e.g. archive on Free).     |
+| `RESOURCE_EXHAUSTED` (8)   | Rate-limit bucket empty, or monthly credit budget consumed.             |
+| Other (`NOT_FOUND`, etc.)  | Pass-through from the upstream fullnode or relay.                       |
+
+## Reliability features
+
+- **Multi-region deployment.** The gateway runs in several geographic
+  regions and is fronted by anycast DNS, so the same endpoint
+  resolves to the topologically nearest region for each client.
+- **Warm upstream pool.** Persistent gRPC channels to a managed pool
+  of Sui fullnodes — no cold connection penalty on individual
+  requests.
+- **Per-customer isolation.** Rate limits, credits, and feature flags
+  are per-customer; one customer's spike never affects another's
+  latency or budget.
+- **Graceful upstream failover.** Unhealthy upstreams are removed
+  from rotation within seconds; in-flight requests retry against a
+  healthy replica.
+- **Idempotent on the read path.** Read methods are safely retryable;
+  the gateway returns deterministic responses across the upstream
+  pool.
+
+## Roadmap
+
+<CardGroup cols={2}>
+  <Card title="Streaming subscriptions" icon="satellite-dish">
+    Full `SubscriptionService` support — checkpoint streams, effect
+    streams, and event filters delivered as gRPC server-streaming
+    responses.
+  </Card>
+  <Card title="Per-key feature flags" icon="key">
+    Override plan-level feature flags on a per-key basis for fine-grained
+    access control across one customer's surfaces.
+  </Card>
+  <Card title="Usage webhooks" icon="webhook">
+    Outbound notifications on threshold events (80% / 100% of monthly
+    credits, sustained rate-limit hits) so customers can react before
+    a hard cutoff.
+  </Card>
+  <Card title="Read-mask cost discounts" icon="filter">
+    Charge fewer credits for read methods that request a small subset
+    of fields via the standard Sui read-mask, rewarding clients that
+    are lean on the wire.
+  </Card>
+</CardGroup>
+
+## Open standards
+
+The RPC Gateway's API is the Sui-native `sui.rpc.v2.*` service suite.
+Customer code is portable: if Koko disappeared tomorrow, you'd swap
+the endpoint URL and keep moving. The auth header is one line of
+config; no client library is owned by Koko. This is deliberate — we
+believe Sui infrastructure should be a market, not a captive product.
+
+For grant collaboration, integration support, or to share a workload
+we should know about: **hello@koko.cloud**.
